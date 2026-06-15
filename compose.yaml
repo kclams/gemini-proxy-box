@@ -1,0 +1,8 @@
+services:
+  gemini-proxy:
+    image: ghcr.io/moshang-ax/gemini-proxy:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+    restart: always
