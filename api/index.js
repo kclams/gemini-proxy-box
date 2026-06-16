@@ -19,7 +19,7 @@ module.exports = async (req, res) => {
   let targetUrl = `https://generativelanguage.googleapis.com${cleanPath}`;
   let isChatCompletion = parsedUrl.pathname.includes('chat/completions');
 
-  // 3. 準備轉發給 Google 的 Headers (主動宣告不接受 Gzip 壓縮)
+  // 3. 準備轉發給 Google 的 Headers (主動宣告不接受 Gzip 壓縮，確保拿到純文字流)
   const headers = {
     'host': 'generativelanguage.googleapis.com',
     'content-type': 'application/json',
@@ -32,7 +32,7 @@ module.exports = async (req, res) => {
     targetUrl += `?key=${apiKey}`;
   }
 
-  // 4. 核心轉譯邏輯：如果 Cline 發送的是 OpenAI 格式的 chat/completions
+  // 4. 核心轉譯邏輯：將 OpenAI 格式轉為 Gemini 格式
   let finalBody = undefined;
   if (isChatCompletion && req.method === 'POST') {
     let bodyText = '';
@@ -51,7 +51,7 @@ module.exports = async (req, res) => {
       let model = openAiBody.model || 'gemini-2.5-flash';
       if (model.includes('gemini-3.5-flash')) model = 'gemini-2.5-flash';
 
-      // 既然 Cline 一定會用 Streaming，我們就強制走 Google 官方的 Streaming 路由
+      // 強制走 Google 官方的 Streaming 路由
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent`;
       if (apiKey) {
         targetUrl += `?key=${apiKey}`;
@@ -86,7 +86,7 @@ module.exports = async (req, res) => {
       body: finalBody
     });
 
-    // 如果是 Chat 且成功連線，強制設定 Response 為 SSE 串流格式，配合 Cline 讀取
+    // 關鍵：如果是 Chat 且成功連線，強制設定 Response 為標準 SSE (text/event-stream) 串流格式
     if (isChatCompletion && fetchResponse.status === 200) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -101,7 +101,7 @@ module.exports = async (req, res) => {
       }
     });
 
-    // 6. 處理 Google 的回傳：完美無損 Streaming 直通
+    // 6. 處理 Google 的回傳：完美實時 Streaming 直通
     if (fetchResponse.body) {
       const reader = fetchResponse.body.getReader();
       const decoder = new TextDecoder('utf-8');
@@ -112,21 +112,20 @@ module.exports = async (req, res) => {
         if (done) break;
 
         if (!isChatCompletion) {
-          // 非 chat/completions 請求直接原汁原味寫入
+          // 非對話請求直接原汁原味寫入
           res.write(value);
         } else {
-          // 關鍵：將 Google 的 streamGenerateContent 格式，動態翻譯成 OpenAI 的 stream 格式
+          // 關鍵：將 Google 的 streamGenerateContent 數據片段，即時提取並翻譯給 Cline
           buffer += decoder.decode(value, { stream: true });
           
-          // Google 串流回應通常是一個 JSON 陣列或獨立的對象塊
-          // 這裡我們直接把文字提取出來，包裝成標準 OpenAI SSE 格式發送
-          try {
-            // 清理可能干擾的逗號或陣列括號，嘗試尋找 text 欄位
-            const match = buffer.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
-            if (match) {
-              for (const m of match) {
+          // 利用正則表達式，只要在緩衝區看到 "text": "..."，就立刻把它撈出來發送
+          const match = buffer.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
+          if (match) {
+            for (const m of match) {
+              try {
                 const textValue = JSON.parse(`{${m}}`).text;
                 if (textValue) {
+                  // 包裝成標準 OpenAI SSE 格式片段
                   const sseChunk = {
                     id: `chatcmpl-${Date.now()}`,
                     object: 'chat.completion.chunk',
@@ -138,18 +137,19 @@ module.exports = async (req, res) => {
                       finish_reason: null
                     }]
                   };
+                  // 一字一字即時吐回給 VS Code Cline
                   res.write(`data: ${JSON.stringify(sseChunk)}\n\n`);
                 }
+              } catch (parseErr) {
+                // 單個片段解析失敗則跳過，防止不完整的轉義字元崩潰
               }
-              buffer = ''; // 清空已處理的緩衝
             }
-          } catch (e) {
-            // 解析失敗時不中斷，等待更多緩衝數據進來
+            buffer = ''; // 成功處理完這一批，清空緩衝區
           }
         }
       }
 
-      // 串流結束，發送結束訊號給 Cline
+      // 當所有數據傳輸完畢，發送標準 OpenAI 結束訊號給 Cline 關閉連接
       if (isChatCompletion) {
         const sseEnd = {
           id: `chatcmpl-${Date.now()}`,
