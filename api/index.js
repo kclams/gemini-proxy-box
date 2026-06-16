@@ -8,15 +8,21 @@ module.exports = async (req, res) => {
     return res.status(204).end();
   }
 
-  // 2. 解析 Cline 發過來的路徑
+  // 2. 精準解析 Cline 發過來的純路徑 (抹除 Vercel vercel.json 產生的 path 參數雜訊)
   let incomingPath = req.url || '';
-  let cleanPath = incomingPath.replace(/^\/api/, '').replace(/^\/v1beta/, '');
+  
+  // 使用虛擬 Host 解析 URL，只拿不含 Query String 的純路徑
+  const parsedUrl = new URL(incomingPath, 'http://localhost');
+  let cleanPath = parsedUrl.pathname; // 這會拿到純粹的 "/v1beta/chat/completions" 或 "/api/..."
+
+  // 清理開頭的 /api 或 /v1beta
+  cleanPath = cleanPath.replace(/^\/api/, '').replace(/^\/v1beta/, '');
   if (!cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
 
   let targetUrl = `https://generativelanguage.googleapis.com${cleanPath}`;
-  let isChatCompletion = incomingPath.includes('chat/completions');
+  let isChatCompletion = parsedUrl.pathname.includes('chat/completions');
 
-  // 3. 準備轉發給 Google 的 Headers (只保留最核心的)
+  // 3. 準備轉發給 Google 的 Headers
   const headers = {
     'host': 'generativelanguage.googleapis.com',
     'content-type': 'application/json'
@@ -26,9 +32,7 @@ module.exports = async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey) {
     headers['x-goog-api-key'] = apiKey;
-    if (!targetUrl.includes('key=')) {
-      targetUrl += targetUrl.includes('?') ? `&key=${apiKey}` : `?key=${apiKey}`;
-    }
+    targetUrl += `?key=${apiKey}`;
   }
 
   // 4. 核心翻譯邏輯：如果 Cline 發送的是 OpenAI 格式的 chat/completions
@@ -53,9 +57,9 @@ module.exports = async (req, res) => {
       const isStream = openAiBody.stream === true;
       const googleAction = isStream ? 'streamGenerateContent' : 'generateContent';
 
-      // 重新拼裝成 Google 官方 REST 網址
+      // 重新拼裝成 Google 官方 REST 網址 (確保後方乾乾淨淨只有 key)
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${googleAction}`;
-      if (apiKey && !targetUrl.includes('key=')) {
+      if (apiKey) {
         targetUrl += `?key=${apiKey}`;
       }
 
@@ -73,7 +77,6 @@ module.exports = async (req, res) => {
       console.error('解析 OpenAI Body 失敗', e);
     }
   } else if (req.method !== 'GET' && req.method !== 'HEAD') {
-    // 非 chat/completions 的常規 POST 請求轉發
     const buffers = [];
     for await (const chunk of req) {
       buffers.push(chunk);
@@ -82,7 +85,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // 5. 正式發送請求給 Google (移除 duplex，使用最基礎的 fetch 結構防止崩潰)
+    // 5. 正式發送請求給 Google
     const fetchResponse = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
@@ -117,12 +120,12 @@ module.exports = async (req, res) => {
 
         try {
           const googleJson = JSON.parse(responseText);
-          // 如果 Google 回報錯誤，直接把錯誤吐回去幫忙除錯
           if (googleJson.error) {
             res.write(JSON.stringify(googleJson));
           } else {
-            const aiText = googleJson.candidates?.[0]?.content?.parts?.[0]?.text || 
-                           googleJson[0]?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            // 兼容單個對象或陣列結構
+            const targetObj = Array.isArray(googleJson) ? googleJson[0] : googleJson;
+            const aiText = targetObj.candidates?.[0]?.content?.parts?.[0]?.text || '';
             
             const openAiResponse = {
               id: `chatcmpl-${Date.now()}`,
