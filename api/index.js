@@ -39,17 +39,41 @@ export default async function handler(req) {
       let model = openAiBody.model || 'gemini-2.5-flash';
       if (model.includes('gemini-3.5-flash')) model = 'gemini-2.5-flash';
 
-      // 🚀 核心魔法：加上 ?alt=sse，強制 Google 輸出絕對不會斷裂的標準串流格式！
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`;
-      if (apiKey) targetUrl += `&key=${apiKey}`; // 這裡用 & 接續
+      if (apiKey) targetUrl += `&key=${apiKey}`;
 
-      // 將 Cline 的角色強制對應為 Gemini 接受的 user / model，防止嚴格模式崩潰
+      // 🚀 升級版：完美支援 Cline 的字串、陣列以及圖片傳輸
       const googleContents = openAiBody.messages.map(msg => {
         const role = msg.role === 'assistant' ? 'model' : 'user';
-        return {
-          role: role,
-          parts: [{ text: msg.content }]
-        };
+        let parts = [];
+
+        // 如果是單純的文字
+        if (typeof msg.content === 'string') {
+          parts = [{ text: msg.content }];
+        } 
+        // 如果是 Cline 傳來的多模態陣列 (包含圖片或複雜結構)
+        else if (Array.isArray(msg.content)) {
+          parts = msg.content.map(part => {
+            if (part.type === 'text') {
+              return { text: part.text };
+            } else if (part.type === 'image_url' && part.image_url?.url) {
+              // 擷取 Base64 圖片並轉換為 Gemini 格式
+              const match = part.image_url.url.match(/^data:(.*?);base64,(.*)$/);
+              if (match) {
+                return {
+                  inlineData: {
+                    mimeType: match[1],
+                    data: match[2]
+                  }
+                };
+              }
+              return { text: `[Image link: ${part.image_url.url}]` };
+            }
+            return { text: JSON.stringify(part) };
+          });
+        }
+
+        return { role: role, parts: parts };
       });
 
       finalBody = JSON.stringify({ contents: googleContents });
@@ -102,10 +126,8 @@ export default async function handler(req) {
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-          
-          // 放棄容易出錯的正則表達式，改用標準的「按行解析」
           const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() || ''; // 把不完整的最末行存回緩衝區等待下一次拼裝
+          buffer = lines.pop() || '';
 
           for (const line of lines) {
             if (line.trim() === '') continue;
@@ -114,7 +136,6 @@ export default async function handler(req) {
               if (dataStr === '[DONE]') continue;
               
               try {
-                // 現在 Google 吐出來的保證是完美的 JSON
                 const googleJson = JSON.parse(dataStr);
                 const textValue = googleJson.candidates?.[0]?.content?.parts?.[0]?.text;
                 
@@ -132,9 +153,7 @@ export default async function handler(req) {
                   };
                   await writer.write(encoder.encode(`data: ${JSON.stringify(sseChunk)}\n\n`));
                 }
-              } catch (parseErr) {
-                // 忽略非預期的雜訊行
-              }
+              } catch (parseErr) {}
             }
           }
         }
