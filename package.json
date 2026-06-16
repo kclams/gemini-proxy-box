@@ -3,10 +3,6 @@
   "version": "1.0.0",
   "description": "Gemini Reverse Proxy for Vercel",
   "main": "api/index.js",
-  "dependencies": {
-    "express": "^4.19.2",
-    "http-proxy-middleware": "^3.0.0"
-  },
   "engines": {
     "node": "24.x"
   }
