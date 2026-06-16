@@ -1,5 +1,5 @@
 export const config = {
-  runtime: 'nodejs' // 確保使用標準 Node.js 環境
+  runtime: 'edge' // 🚀 關鍵修改：必須切換為 Edge 環境，才能完美支援原生 Streaming！
 };
 
 export default async function handler(req) {
@@ -27,7 +27,7 @@ export default async function handler(req) {
   const headers = new Headers();
   headers.set('host', 'generativelanguage.googleapis.com');
   headers.set('content-type', 'application/json');
-  headers.set('accept-encoding', 'identity'); // 拒絕壓縮，防止 Z_DATA_ERROR
+  headers.set('accept-encoding', 'identity');
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey) {
@@ -44,11 +44,9 @@ export default async function handler(req) {
       let model = openAiBody.model || 'gemini-2.5-flash';
       if (model.includes('gemini-3.5-flash')) model = 'gemini-2.5-flash';
 
-      // 強制走 Google 官方的 Streaming 路由
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent`;
       if (apiKey) targetUrl += `?key=${apiKey}`;
 
-      // 翻譯 messages 陣列
       const googleContents = openAiBody.messages.map(msg => {
         const role = msg.role === 'assistant' ? 'model' : msg.role;
         return {
@@ -79,7 +77,6 @@ export default async function handler(req) {
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
     responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-goog-api-key');
 
-    // 如果不是 chat/completions，直接原封不動把 Google 的 Response 倒回去
     if (!isChatCompletion || fetchResponse.status !== 200) {
       fetchResponse.headers.forEach((value, key) => {
         if (!key.toLowerCase().startsWith('access-control-')) {
@@ -92,7 +89,7 @@ export default async function handler(req) {
       });
     }
 
-    // 7. 如果是對話請求，建立一個「真・即時串流（TransformStream）」實時翻譯給 Cline
+    // 7. 啟動 Edge 原生即時串流（TransformStream）
     responseHeaders.set('Content-Type', 'text/event-stream');
     responseHeaders.set('Cache-Control', 'no-cache');
     responseHeaders.set('Connection', 'keep-alive');
@@ -103,7 +100,6 @@ export default async function handler(req) {
     const decoder = new TextDecoder('utf-8');
     const encoder = new TextEncoder();
     
-    // 非同步執行的串流轉換器，絕不卡死連線
     (async () => {
       let buffer = '';
       try {
@@ -113,7 +109,6 @@ export default async function handler(req) {
 
           buffer += decoder.decode(value, { stream: true });
           
-          // 即時撈出 "text": "..." 欄位
           const match = buffer.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
           if (match) {
             for (const m of match) {
@@ -131,7 +126,6 @@ export default async function handler(req) {
                       finish_reason: null
                     }]
                   };
-                  // 毫不延遲，發現一個字，就立刻噴回給 VS Code Cline
                   await writer.write(encoder.encode(`data: ${JSON.stringify(sseChunk)}\n\n`));
                 }
               } catch (pErr) {}
@@ -140,7 +134,6 @@ export default async function handler(req) {
           }
         }
 
-        // 結束串流訊號
         const sseEnd = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -157,7 +150,6 @@ export default async function handler(req) {
       }
     })();
 
-    // 返回這個可讀流，Vercel 網關會自動進行真實 Streaming 轉發！
     return new Response(readable, {
       status: 200,
       headers: responseHeaders
