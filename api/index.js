@@ -8,34 +8,31 @@ module.exports = async (req, res) => {
     return res.status(204).end();
   }
 
-  // 2. 精準解析 Cline 發過來的純路徑 (抹除 Vercel vercel.json 產生的 path 參數雜訊)
+  // 2. 精準解析 Cline 發過來的純路徑
   let incomingPath = req.url || '';
-  
-  // 使用虛擬 Host 解析 URL，只拿不含 Query String 的純路徑
   const parsedUrl = new URL(incomingPath, 'http://localhost');
-  let cleanPath = parsedUrl.pathname; // 這會拿到純粹的 "/v1beta/chat/completions" 或 "/api/..."
+  let cleanPath = parsedUrl.pathname;
 
-  // 清理開頭的 /api 或 /v1beta
   cleanPath = cleanPath.replace(/^\/api/, '').replace(/^\/v1beta/, '');
   if (!cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
 
   let targetUrl = `https://generativelanguage.googleapis.com${cleanPath}`;
   let isChatCompletion = parsedUrl.pathname.includes('chat/completions');
 
-  // 3. 準備轉發給 Google 的 Headers
+  // 3. 準備轉發給 Google 的 Headers (主動宣告不接受 Gzip，防止 Z_DATA_ERROR)
   const headers = {
     'host': 'generativelanguage.googleapis.com',
-    'content-type': 'application/json'
+    'content-type': 'application/json',
+    'accept-encoding': 'identity' // 關鍵：強制要求 Google 吐出未壓縮的原始文字流
   };
 
-  // 注入 Vercel 後台的 API Key
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey) {
     headers['x-goog-api-key'] = apiKey;
     targetUrl += `?key=${apiKey}`;
   }
 
-  // 4. 核心翻譯邏輯：如果 Cline 發送的是 OpenAI 格式的 chat/completions
+  // 4. 核心翻譯邏輯
   let finalBody = undefined;
   if (isChatCompletion && req.method === 'POST') {
     let bodyText = '';
@@ -57,13 +54,11 @@ module.exports = async (req, res) => {
       const isStream = openAiBody.stream === true;
       const googleAction = isStream ? 'streamGenerateContent' : 'generateContent';
 
-      // 重新拼裝成 Google 官方 REST 網址 (確保後方乾乾淨淨只有 key)
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${googleAction}`;
       if (apiKey) {
         targetUrl += `?key=${apiKey}`;
       }
 
-      // 翻譯 messages
       const googleContents = openAiBody.messages.map(msg => {
         const role = msg.role === 'assistant' ? 'model' : msg.role;
         return {
@@ -95,7 +90,8 @@ module.exports = async (req, res) => {
     res.status(fetchResponse.status);
 
     fetchResponse.headers.forEach((value, key) => {
-      if (!key.toLowerCase().startsWith('access-control-')) {
+      // 抹除 Google 的 content-encoding 標頭，防止客戶端重複解壓縮崩潰
+      if (!key.toLowerCase().startsWith('access-control-') && key.toLowerCase() !== 'content-encoding') {
         res.setHeader(key, value);
       }
     });
@@ -112,10 +108,11 @@ module.exports = async (req, res) => {
         }
       } else {
         let responseText = '';
+        const decoder = new TextDecoder('utf-8');
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          responseText += new TextDecoder().decode(value);
+          responseText += decoder.decode(value, { stream: true });
         }
 
         try {
@@ -123,7 +120,6 @@ module.exports = async (req, res) => {
           if (googleJson.error) {
             res.write(JSON.stringify(googleJson));
           } else {
-            // 兼容單個對象或陣列結構
             const targetObj = Array.isArray(googleJson) ? googleJson[0] : googleJson;
             const aiText = targetObj.candidates?.[0]?.content?.parts?.[0]?.text || '';
             
@@ -141,6 +137,7 @@ module.exports = async (req, res) => {
             res.write(JSON.stringify(openAiResponse));
           }
         } catch (jsonErr) {
+          // 如果解析 JSON 失敗，保底直接把原始文字吐回去
           res.write(responseText);
         }
       }
