@@ -1,9 +1,8 @@
 export const config = {
-  runtime: 'edge' // 🚀 關鍵修改：必須切換為 Edge 環境，才能完美支援原生 Streaming！
+  runtime: 'edge'
 };
 
 export default async function handler(req) {
-  // 1. 處理 CORS 跨域預檢 (OPTIONS)
   if (req.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -15,7 +14,6 @@ export default async function handler(req) {
     });
   }
 
-  // 2. 解析並重寫目標路徑
   const url = new URL(req.url);
   let cleanPath = url.pathname.replace(/^\/api/, '').replace(/^\/v1beta/, '');
   if (!cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
@@ -23,32 +21,31 @@ export default async function handler(req) {
   let targetUrl = `https://generativelanguage.googleapis.com${cleanPath}`;
   const isChatCompletion = url.pathname.includes('chat/completions');
 
-  // 3. 建立轉發給 Google 的 Headers
   const headers = new Headers();
   headers.set('host', 'generativelanguage.googleapis.com');
   headers.set('content-type', 'application/json');
   headers.set('accept-encoding', 'identity');
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (apiKey) {
-    headers.set('x-goog-api-key', apiKey);
+  if (apiKey && !isChatCompletion) {
     targetUrl += `?key=${apiKey}`;
   }
 
   let finalBody = null;
 
-  // 4. 翻譯邏輯：將 OpenAI 格式轉為 Gemini 格式
   if (isChatCompletion && req.method === 'POST') {
     try {
       const openAiBody = await req.json();
       let model = openAiBody.model || 'gemini-2.5-flash';
       if (model.includes('gemini-3.5-flash')) model = 'gemini-2.5-flash';
 
-      targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent`;
-      if (apiKey) targetUrl += `?key=${apiKey}`;
+      // 🚀 核心魔法：加上 ?alt=sse，強制 Google 輸出絕對不會斷裂的標準串流格式！
+      targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`;
+      if (apiKey) targetUrl += `&key=${apiKey}`; // 這裡用 & 接續
 
+      // 將 Cline 的角色強制對應為 Gemini 接受的 user / model，防止嚴格模式崩潰
       const googleContents = openAiBody.messages.map(msg => {
-        const role = msg.role === 'assistant' ? 'model' : msg.role;
+        const role = msg.role === 'assistant' ? 'model' : 'user';
         return {
           role: role,
           parts: [{ text: msg.content }]
@@ -64,14 +61,12 @@ export default async function handler(req) {
   }
 
   try {
-    // 5. 正式向 Google 發起請求
     const fetchResponse = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
       body: finalBody
     });
 
-    // 6. 設定要回傳給 Cline 的基底 Headers
     const responseHeaders = new Headers();
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
@@ -89,7 +84,6 @@ export default async function handler(req) {
       });
     }
 
-    // 7. 啟動 Edge 原生即時串流（TransformStream）
     responseHeaders.set('Content-Type', 'text/event-stream');
     responseHeaders.set('Cache-Control', 'no-cache');
     responseHeaders.set('Connection', 'keep-alive');
@@ -109,11 +103,21 @@ export default async function handler(req) {
 
           buffer += decoder.decode(value, { stream: true });
           
-          const match = buffer.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
-          if (match) {
-            for (const m of match) {
+          // 放棄容易出錯的正則表達式，改用標準的「按行解析」
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || ''; // 把不完整的最末行存回緩衝區等待下一次拼裝
+
+          for (const line of lines) {
+            if (line.trim() === '') continue;
+            if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6).trim();
+              if (dataStr === '[DONE]') continue;
+              
               try {
-                const textValue = JSON.parse(`{${m}}`).text;
+                // 現在 Google 吐出來的保證是完美的 JSON
+                const googleJson = JSON.parse(dataStr);
+                const textValue = googleJson.candidates?.[0]?.content?.parts?.[0]?.text;
+                
                 if (textValue) {
                   const sseChunk = {
                     id: `chatcmpl-${Date.now()}`,
@@ -128,9 +132,10 @@ export default async function handler(req) {
                   };
                   await writer.write(encoder.encode(`data: ${JSON.stringify(sseChunk)}\n\n`));
                 }
-              } catch (pErr) {}
+              } catch (parseErr) {
+                // 忽略非預期的雜訊行
+              }
             }
-            buffer = '';
           }
         }
 
@@ -144,7 +149,7 @@ export default async function handler(req) {
         await writer.write(encoder.encode(`data: ${JSON.stringify(sseEnd)}\n\n`));
         await writer.write(encoder.encode('data: [DONE]\n\n'));
       } catch (err) {
-        console.error('串流轉換錯誤:', err);
+        console.error('Stream error:', err);
       } finally {
         await writer.close();
       }
@@ -156,7 +161,6 @@ export default async function handler(req) {
     });
 
   } catch (error) {
-    console.error('Proxy Error:', error);
     return new Response(JSON.stringify({ error: 'Proxy failed', message: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
