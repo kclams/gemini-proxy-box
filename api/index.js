@@ -13,7 +13,11 @@ module.exports = async (req, res) => {
   let incomingPath = req.url;
 
   // 預設目標網址
-  let targetUrl = `https://generativelanguage.googleapis.com${incomingPath.replace(/^\/api/, '')}`;
+  // 移除開頭可能存在的 /api 或 /v1beta，確保拼裝給 Google 的路徑正確
+  let cleanPath = incomingPath.replace(/^\/api/, '').replace(/^\/v1beta/, '');
+  if (!cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
+
+  let targetUrl = `https://generativelanguage.googleapis.com${cleanPath}`;
   let isChatCompletion = incomingPath.includes('chat/completions');
 
   // 3. 核心翻譯邏輯：如果 Cline 發送的是 OpenAI 格式的 chat/completions
